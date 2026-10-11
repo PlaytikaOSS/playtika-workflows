@@ -1,0 +1,315 @@
+name: Reusable Maven Central release
+
+on:
+  workflow_call:
+    inputs:
+      workflow-sha:
+        description: The full SHA used to pin this shared workflow in the caller
+        required: true
+        type: string
+      group-id:
+        description: Maven group ID of the staged artifacts
+        required: true
+        type: string
+      release-branch:
+        description: Protected branch containing approved release commits
+        default: develop
+        type: string
+      java-version:
+        description: JDK version for the Maven build
+        default: '21'
+        type: string
+      skip-tests:
+        description: Skip Maven test execution when separately verified by required CI
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: maven-central-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Validate release authorization and source
+        id: release
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          RELEASE_ACTORS: ${{ vars.RELEASE_ACTORS }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SHARED_WORKFLOW_SHA: ${{ inputs.workflow-sha }}
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
+          GROUP_ID: ${{ inputs.group-id }}
+        with:
+          script: &release-policy |
+            const eventRelease = context.payload.release;
+            if (context.eventName !== 'release' || context.payload.action !== 'published' ||
+                context.repo.owner !== 'PlaytikaOSS' ||
+                !eventRelease || eventRelease.draft || eventRelease.prerelease) {
+              throw new Error('Only published production releases in PlaytikaOSS are allowed');
+            }
+            const {data: release} = await github.rest.repos.getRelease({
+              ...context.repo, release_id: eventRelease.id
+            });
+            if (release.draft || release.prerelease || release.tag_name !== eventRelease.tag_name) {
+              throw new Error('Published release has changed');
+            }
+            const actors = (process.env.RELEASE_ACTORS || '').split(',').map(actor => actor.trim()).filter(Boolean);
+            for (const actor of [context.actor, process.env.TRIGGERING_ACTOR, release.author?.login]) {
+              if (!actor || !actors.includes(actor)) {
+                throw new Error('Release actor is not in the RELEASE_ACTORS allowlist');
+              }
+            }
+            const {data: environment} = await github.rest.repos.getEnvironment({
+              ...context.repo, environment_name: 'maven-central'
+            });
+            if (!environment.protection_rules?.some(rule => rule.type === 'required_reviewers' &&
+                  rule.prevent_self_review === true && rule.reviewers?.length > 0) ||
+                !environment.deployment_branch_policy?.custom_branch_policies) {
+              throw new Error('maven-central must require independent reviewers and restrict deployment refs');
+            }
+            const {data: policies} = await github.rest.repos.listDeploymentBranchPolicies({
+              ...context.repo, environment_name: 'maven-central', per_page: 100
+            });
+            if (!policies.branch_policies.length || policies.total_count !== policies.branch_policies.length ||
+                !policies.branch_policies.every(policy => policy.type === 'tag' &&
+                  policy.name === '[0-9]*.[0-9]*.[0-9]*')) {
+              throw new Error('maven-central must only permit version tags matching [0-9]*.[0-9]*.[0-9]*');
+            }
+            if (!/^[0-9a-f]{40}$/.test(process.env.SHARED_WORKFLOW_SHA || '') ||
+                !/^com\.playtika(?:\.[a-z][a-z0-9_]*)*$/.test(process.env.GROUP_ID || '')) {
+              throw new Error('Caller must pin the shared workflow SHA and use a Playtika Maven group');
+            }
+            const tag = release.tag_name;
+            if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(tag) ||
+                context.ref !== `refs/tags/${tag}` || !/^[0-9a-f]{40}$/.test(context.sha)) {
+              throw new Error('Release must use a stable version tag and a full commit SHA');
+            }
+            let { data: { object } } = await github.rest.git.getRef({...context.repo, ref: `tags/${tag}`});
+            for (let depth = 0; object.type === 'tag' && depth < 8; depth++) {
+              ({data: {object}} = await github.rest.git.getTag({...context.repo, tag_sha: object.sha}));
+            }
+            if (object.type !== 'commit' || object.sha !== context.sha ||
+                process.env.WORKFLOW_SHA !== context.sha) {
+              throw new Error('Release tag, event and workflow must identify the same immutable commit');
+            }
+            const {data: branch} = await github.rest.repos.getBranch({...context.repo, branch: process.env.RELEASE_BRANCH});
+            if (!branch.protected) {
+              throw new Error('The release branch must be protected');
+            }
+            const {data: comparison} = await github.rest.repos.compareCommits({
+              ...context.repo, base: object.sha, head: process.env.RELEASE_BRANCH
+            });
+            if (!['ahead', 'identical'].includes(comparison.status)) {
+              throw new Error('Release commit must be on the protected release branch');
+            }
+            core.setOutput('sha', object.sha);
+            core.setOutput('tag', tag);
+            await core.summary.addHeading('Validated immutable release source')
+              .addTable([['Tag', 'Commit'], [tag, object.sha]]).write();
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      bundle_sha256: ${{ steps.bundle.outputs.sha256 }}
+    env:
+      RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      SKIP_TESTS: ${{ inputs.skip-tests }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+
+      - name: Set up JDK without publication credentials
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: corretto
+          java-version: ${{ inputs.java-version }}
+
+      - name: Build unsigned artifacts into a local repository
+        run: |
+          ./mvnw --batch-mode --no-transfer-progress org.codehaus.mojo:versions-maven-plugin:2.19.1:set \
+            -DnewVersion="$RELEASE_TAG" -DgenerateBackupPoms=false
+          ./mvnw --batch-mode --no-transfer-progress -Dgib.disable=true -DskipTests="$SKIP_TESTS" \
+            -DaltDeploymentRepository="staging::file://${RUNNER_TEMP}/central-staging" \
+            clean install org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy
+
+      - name: Bundle unsigned artifacts
+        id: bundle
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import zipfile
+
+          staging = Path(os.environ['RUNNER_TEMP']) / 'central-staging'
+          files = sorted(path for path in staging.rglob('*') if path.suffix in {'.jar', '.pom'})
+          if not files:
+              raise SystemExit('No release artifacts were built')
+          bundle = Path(os.environ['RUNNER_TEMP']) / 'central-bundle.zip'
+          with zipfile.ZipFile(bundle, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in files:
+                  if path.is_symlink() or not path.is_file():
+                      raise SystemExit('Only regular artifact files are allowed')
+                  archive.write(path, path.relative_to(staging).as_posix())
+          with bundle.open('rb') as source, open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'sha256={hashlib.file_digest(source, "sha256").hexdigest()}\n')
+          PY
+
+      - name: Upload immutable unsigned bundle
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: central-bundle-${{ needs.validate.outputs.sha }}
+          path: ${{ runner.temp }}/central-bundle.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # No checkout or repository code runs with the attestation token.
+      - name: Attest the unsigned bundle digest
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-name: central-bundle.zip
+          subject-digest: sha256:${{ needs.build.outputs.bundle_sha256 }}
+
+  publish:
+    needs: [validate, build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: maven-central
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    env:
+      RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      GROUP_ID: ${{ inputs.group-id }}
+      SHARED_WORKFLOW_SHA: ${{ inputs.workflow-sha }}
+    steps:
+      - name: Recheck authorization and source after environment approval
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          RELEASE_ACTORS: ${{ vars.RELEASE_ACTORS }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SHARED_WORKFLOW_SHA: ${{ inputs.workflow-sha }}
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
+          GROUP_ID: ${{ inputs.group-id }}
+        with:
+          script: *release-policy
+
+      - name: Download the bundle from this build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+
+      - name: Verify attested digest and source before accessing secrets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+        run: |
+          printf '%s  %s\n' "$BUNDLE_SHA256" "$RUNNER_TEMP/unsigned/central-bundle.zip" | sha256sum --check --strict
+          gh attestation verify "$RUNNER_TEMP/unsigned/central-bundle.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "PlaytikaOSS/playtika-workflows/.github/workflows/maven-central-release.yml" \
+            --signer-digest "$SHARED_WORKFLOW_SHA" --source-digest "$RELEASE_SHA" \
+            --source-ref "refs/tags/$RELEASE_TAG" --deny-self-hosted-runners
+
+      # Treat the downloaded artifacts as data. Never run Maven, a wrapper,
+      # scripts, plugins or JReleaser configuration from the build in this job.
+      - name: Prepare verified artifacts and fixed JReleaser configuration
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import zipfile
+
+          version = re.escape(os.environ['RELEASE_TAG'])
+          group = re.escape(os.environ['GROUP_ID'].replace('.', '/'))
+          allowed = re.compile(group + r'/([A-Za-z0-9_.-]+)/' + version
+                               + r'/\1-' + version + r'(?:-[A-Za-z0-9_.-]+)?\.(?:jar|pom)')
+          publisher = Path(os.environ['RUNNER_TEMP']) / 'publisher'
+          artifacts = publisher / 'staging'
+          with zipfile.ZipFile(Path(os.environ['RUNNER_TEMP']) / 'unsigned/central-bundle.zip') as archive:
+              entries = archive.infolist()
+              if not entries or len({entry.filename for entry in entries}) != len(entries):
+                  raise SystemExit('Empty bundle or duplicate artifact paths')
+              if sum(entry.file_size for entry in entries) > 1024**3:
+                  raise SystemExit('Release bundle exceeds 1 GiB')
+              if not any(entry.filename.endswith('.pom') for entry in entries):
+                  raise SystemExit('Release bundle is missing POMs')
+              for entry in entries:
+                  mode = entry.external_attr >> 16
+                  if not allowed.fullmatch(entry.filename) or stat.S_IFMT(mode) not in (0, stat.S_IFREG):
+                      raise SystemExit('Bundle contains an unexpected artifact path or file type')
+              for entry in entries:
+                  path = artifacts / entry.filename
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(archive.read(entry))
+          owner, name = os.environ['GITHUB_REPOSITORY'].split('/')
+          configuration = {
+              'project': {'name': name, 'version': os.environ['RELEASE_TAG'],
+                          'description': name, 'authors': ['PlaytikaOSS'], 'license': 'Apache-2.0',
+                          'languages': {'java': {'groupId': os.environ['GROUP_ID']}}},
+              'release': {'github': {'owner': owner, 'name': name, 'skipTag': True, 'skipRelease': True}},
+              'signing': {'pgp': {'active': 'ALWAYS', 'armored': True, 'verify': True}},
+              'deploy': {'maven': {'mavenCentral': {'sonatype': {
+                  'active': 'RELEASE', 'url': 'https://central.sonatype.com/api/v1/publisher',
+                  'applyMavenCentralRules': True, 'verifyPom': False,
+                  'stagingRepositories': [str(artifacts)]}}}}
+          }
+          # PomChecker uses Maven's project builder. Keep it out of the job
+          # with secrets; Central validates POM metadata on the server.
+          (publisher / 'jreleaser.json').write_text(json.dumps(configuration))
+          PY
+
+      - name: Sign and publish verified artifacts with JReleaser
+        uses: jreleaser/release-action@97b5e2f0e845de2fe1dbbdf451ac6a21233fafff # v2
+        with:
+          version: '1.26.0'
+          arguments: deploy --config-file=jreleaser.json --strict
+          working-directory: ${{ runner.temp }}/publisher
+        env:
+          JRELEASER_GITHUB_TOKEN: ${{ github.token }}
+          JRELEASER_GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+          JRELEASER_GPG_SECRET_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          JRELEASER_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          JRELEASER_MAVENCENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          JRELEASER_MAVENCENTRAL_TOKEN: ${{ secrets.MAVEN_CENTRAL_TOKEN }}
