@@ -11,6 +11,18 @@ on:
         description: Maven group ID of the staged artifacts
         required: true
         type: string
+      tag-prefix:
+        description: Literal prefix before the Maven version in release tags
+        default: ''
+        type: string
+      version-components:
+        description: Number of numeric Maven version components (2 or 3)
+        default: 3
+        type: number
+      version-suffix:
+        description: Optional stable Maven version suffix such as .RELEASE
+        default: ''
+        type: string
       release-branch:
         description: Protected branch containing approved release commits
         default: develop
@@ -39,6 +51,7 @@ jobs:
     outputs:
       sha: ${{ steps.release.outputs.sha }}
       tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Validate release authorization and source
         id: release
@@ -50,6 +63,10 @@ jobs:
           SHARED_WORKFLOW_SHA: ${{ inputs.workflow-sha }}
           RELEASE_BRANCH: ${{ inputs.release-branch }}
           GROUP_ID: ${{ inputs.group-id }}
+          RELEASE_GROUP_IDS: ${{ vars.RELEASE_GROUP_IDS }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          VERSION_COMPONENTS: ${{ inputs.version-components }}
+          VERSION_SUFFIX: ${{ inputs.version-suffix }}
         with:
           script: &release-policy |
             const eventRelease = context.payload.release;
@@ -78,20 +95,35 @@ jobs:
                 !environment.deployment_branch_policy?.custom_branch_policies) {
               throw new Error('maven-central must require independent reviewers and restrict deployment refs');
             }
+            const prefix = process.env.TAG_PREFIX || '';
+            const suffix = process.env.VERSION_SUFFIX || '';
+            const components = Number(process.env.VERSION_COMPONENTS || '3');
+            if (!/^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,99})?$/.test(prefix) ||
+                !/^(?:\.[A-Z][A-Z0-9]*)?$/.test(suffix) || suffix.includes('SNAPSHOT') ||
+                ![2, 3].includes(components)) {
+              throw new Error('Invalid stable release tag convention');
+            }
+            const tagPolicy = prefix + Array(components).fill('[0-9]*').join('.') + suffix;
             const {data: policies} = await github.rest.repos.listDeploymentBranchPolicies({
               ...context.repo, environment_name: 'maven-central', per_page: 100
             });
             if (!policies.branch_policies.length || policies.total_count !== policies.branch_policies.length ||
                 !policies.branch_policies.every(policy => policy.type === 'tag' &&
-                  policy.name === '[0-9]*.[0-9]*.[0-9]*')) {
-              throw new Error('maven-central must only permit version tags matching [0-9]*.[0-9]*.[0-9]*');
+                  policy.name === tagPolicy)) {
+              throw new Error(`maven-central must only permit version tags matching ${tagPolicy}`);
             }
+            const group = process.env.GROUP_ID || '';
+            const extraGroups = (process.env.RELEASE_GROUP_IDS || '').split(',').map(group => group.trim()).filter(Boolean);
             if (!/^[0-9a-f]{40}$/.test(process.env.SHARED_WORKFLOW_SHA || '') ||
-                !/^com\.playtika(?:\.[a-z][a-z0-9_]*)*$/.test(process.env.GROUP_ID || '')) {
-              throw new Error('Caller must pin the shared workflow SHA and use a Playtika Maven group');
+                !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/.test(group) ||
+                (!/^com\.playtika(?:\.[a-z][a-z0-9_]*)*$/.test(group) && !extraGroups.includes(group))) {
+              throw new Error('Caller must pin the shared workflow SHA and use an approved Maven group');
             }
             const tag = release.tag_name;
-            if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(tag) ||
+            const escapeRegex = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const versionPattern = Array(components).fill('(0|[1-9][0-9]*)').join('\\.');
+            const tagPattern = new RegExp('^' + escapeRegex(prefix) + versionPattern + escapeRegex(suffix) + '$');
+            if (!tagPattern.test(tag) || tag.includes('\n') ||
                 context.ref !== `refs/tags/${tag}` || !/^[0-9a-f]{40}$/.test(context.sha)) {
               throw new Error('Release must use a stable version tag and a full commit SHA');
             }
@@ -115,8 +147,9 @@ jobs:
             }
             core.setOutput('sha', object.sha);
             core.setOutput('tag', tag);
+            core.setOutput('version', tag.slice(prefix.length));
             await core.summary.addHeading('Validated immutable release source')
-              .addTable([['Tag', 'Commit'], [tag, object.sha]]).write();
+              .addTable([['Tag', 'Maven version', 'Commit'], [tag, tag.slice(prefix.length), object.sha]]).write();
 
   build:
     needs: validate
@@ -130,6 +163,7 @@ jobs:
     env:
       RELEASE_SHA: ${{ needs.validate.outputs.sha }}
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
       SKIP_TESTS: ${{ inputs.skip-tests }}
     steps:
       - name: Checkout validated commit
@@ -150,8 +184,8 @@ jobs:
       - name: Build unsigned artifacts into a local repository
         run: |
           ./mvnw --batch-mode --no-transfer-progress org.codehaus.mojo:versions-maven-plugin:2.19.1:set \
-            -DnewVersion="$RELEASE_TAG" -DgenerateBackupPoms=false
-          ./mvnw --batch-mode --no-transfer-progress -Dgib.disable=true -DskipTests="$SKIP_TESTS" \
+            -Dgib.disable=true -DnewVersion="$RELEASE_VERSION" -DgenerateBackupPoms=false
+          ./mvnw --batch-mode --no-transfer-progress -Dgib.disable=true -Dgpg.skip=true -DskipTests="$SKIP_TESTS" \
             -DaltDeploymentRepository="staging::file://${RUNNER_TEMP}/central-staging" \
             clean install org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy
 
@@ -215,6 +249,7 @@ jobs:
     env:
       RELEASE_SHA: ${{ needs.validate.outputs.sha }}
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
       GROUP_ID: ${{ inputs.group-id }}
       SHARED_WORKFLOW_SHA: ${{ inputs.workflow-sha }}
     steps:
@@ -227,6 +262,10 @@ jobs:
           SHARED_WORKFLOW_SHA: ${{ inputs.workflow-sha }}
           RELEASE_BRANCH: ${{ inputs.release-branch }}
           GROUP_ID: ${{ inputs.group-id }}
+          RELEASE_GROUP_IDS: ${{ vars.RELEASE_GROUP_IDS }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          VERSION_COMPONENTS: ${{ inputs.version-components }}
+          VERSION_SUFFIX: ${{ inputs.version-suffix }}
         with:
           script: *release-policy
 
@@ -261,7 +300,7 @@ jobs:
           import stat
           import zipfile
 
-          version = re.escape(os.environ['RELEASE_TAG'])
+          version = re.escape(os.environ['RELEASE_VERSION'])
           group = re.escape(os.environ['GROUP_ID'].replace('.', '/'))
           allowed = re.compile(group + r'/([A-Za-z0-9_.-]+)/' + version
                                + r'/\1-' + version + r'(?:-[A-Za-z0-9_.-]+)?\.(?:jar|pom)')
@@ -285,7 +324,7 @@ jobs:
                   path.write_bytes(archive.read(entry))
           owner, name = os.environ['GITHUB_REPOSITORY'].split('/')
           configuration = {
-              'project': {'name': name, 'version': os.environ['RELEASE_TAG'],
+              'project': {'name': name, 'version': os.environ['RELEASE_VERSION'],
                           'description': name, 'authors': ['PlaytikaOSS'], 'license': 'Apache-2.0',
                           'languages': {'java': {'groupId': os.environ['GROUP_ID']}}},
               'release': {'github': {'owner': owner, 'name': name, 'skipTag': True, 'skipRelease': True}},

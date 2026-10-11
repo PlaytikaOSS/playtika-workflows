@@ -43,17 +43,35 @@ branches or tags for `uses`, and do not add `secrets: inherit`.
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `workflow-sha` | Required | Full SHA matching the caller's `uses` pin |
-| `group-id` | Required | Maven group shared by all staged modules, under `com.playtika` |
+| `group-id` | Required | Maven group shared by all staged modules; other namespaces require `RELEASE_GROUP_IDS` |
+| `tag-prefix` | Empty | Literal tag prefix, stripped from the Maven version |
+| `version-components` | `3` | Two or three numeric version components |
+| `version-suffix` | Empty | Stable suffix such as `.RELEASE`; snapshots are rejected |
 | `release-branch` | `develop` | Protected branch containing approved release commits |
 | `java-version` | `21` | JDK for the Maven build |
 | `skip-tests` | `false` | Set to `true` only when required CI verifies tests separately |
 
 For example, another caller can set `group-id: com.playtika.testcontainers` and
 `release-branch: main`. Projects must have a Maven wrapper and generate their
-publication artifacts during `install`. Release tags are stable numeric versions,
+publication artifacts during `install`. Release tags default to stable numeric versions,
 such as `5.0.0`; manual publication, snapshots, drafts and prereleases are rejected.
 The build updates POM versions locally to the release tag. It does not push source
 changes or require a GitHub App write token.
+
+Legacy tag conventions remain explicit. For example, `tag-prefix:
+graphqlcodegen-maven-plugin-` and `version-components: 2` map tag
+`graphqlcodegen-maven-plugin-1.13` to Maven version `1.13`. A caller can set
+`tag-prefix: v` and `version-suffix: .RELEASE` for `v2.4.3.RELEASE`. Configure
+the Environment's tag-only policy with the same prefix, number of numeric
+components and suffix, such as `graphqlcodegen-maven-plugin-[0-9]*.[0-9]*`
+or `v[0-9]*.[0-9]*.[0-9]*.RELEASE`. Provenance still binds the full original tag.
+
+Forks that retain another Maven namespace must set the caller repository's
+Actions variable `RELEASE_GROUP_IDS` to the exact permitted group, for example
+`com.aerospike`. Additional groups are comma-separated exact values; there are
+no wildcard grants. Central credentials must have permission to publish that
+namespace. This setting does not grant namespace ownership. The default
+`com.playtika` namespace rule is unchanged.
 
 ## Onboard each caller repository
 
@@ -66,7 +84,8 @@ changes or require a GitHub App write token.
    those actors must be allowed; an empty configuration rejects publication.
 3. Create the caller repository's `maven-central` GitHub Environment. Require
    reviewers, enable **Prevent self-review**, disable administrator bypass, and
-   configure a tag-only deployment policy named `[0-9]*.[0-9]*.[0-9]*`.
+   configure a tag-only deployment policy named `[0-9]*.[0-9]*.[0-9]*`, or the
+   exact policy derived from the caller's explicit legacy tag inputs above.
    The workflow checks that reviewers, self-review prevention and this tag policy
    exist. Administrator bypass is an external setting not exposed by that API.
 4. Put these secrets in the **caller repository's Environment**:
