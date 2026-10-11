@@ -53,7 +53,8 @@ class SourcePolicyTests(unittest.TestCase):
         self.fixture['release'] = copy.deepcopy(self.fixture['context']['payload']['release'])
         self.env = {'RELEASE_ACTORS': 'maintainer, approved-bot', 'TRIGGERING_ACTOR': 'maintainer',
                     'WORKFLOW_SHA': SHA, 'SHARED_WORKFLOW_SHA': 'b' * 40,
-                    'RELEASE_BRANCH': 'develop', 'GROUP_ID': 'com.playtika.reactivefeign'}
+                    'RELEASE_BRANCH': 'develop', 'GROUP_ID': 'com.playtika.reactivefeign',
+                    'TAG_PREFIX': '', 'VERSION_COMPONENTS': '3', 'VERSION_SUFFIX': '', 'RELEASE_GROUP_IDS': ''}
 
     def run_policy(self, approved=True):
         fixture = copy.deepcopy(self.fixture)
@@ -101,7 +102,9 @@ class SourcePolicyTests(unittest.TestCase):
         result = json.loads(result.stdout)
         self.assertEqual(result['approved'], approved, result)
         if approved:
-            self.assertEqual(result['outputs'], {'sha': SHA, 'tag': TAG})
+            tag = self.fixture['release']['tag_name']
+            self.assertEqual(result['outputs'], {'sha': SHA, 'tag': tag,
+                             'version': tag[len(self.env['TAG_PREFIX']):]})
         else:
             self.assertEqual(result['outputs'], {})
 
@@ -124,6 +127,40 @@ class SourcePolicyTests(unittest.TestCase):
         self.env['SHARED_WORKFLOW_SHA'] = 'b' * 40
         self.env['GROUP_ID'] = 'com.attacker'
         self.run_policy(False)
+
+    def test_fork_group_requires_explicit_repository_opt_in(self):
+        self.env['GROUP_ID'] = 'com.aerospike'
+        self.run_policy(False)
+        self.env['RELEASE_GROUP_IDS'] = 'com.aerospike.other'
+        self.run_policy(False)
+        self.env['RELEASE_GROUP_IDS'] = 'com.aerospike'
+        self.run_policy()
+        self.env['GROUP_ID'] = '../com.aerospike'
+        self.env['RELEASE_GROUP_IDS'] = '../com.aerospike'
+        self.run_policy(False)
+
+    def test_legacy_tag_conventions_bind_tag_and_maven_version(self):
+        for tag, prefix, components, suffix, policy in [
+                ('graphqlcodegen-maven-plugin-1.13', 'graphqlcodegen-maven-plugin-', '2', '',
+                 'graphqlcodegen-maven-plugin-[0-9]*.[0-9]*'),
+                ('v2.4.3.RELEASE', 'v', '3', '.RELEASE', 'v[0-9]*.[0-9]*.[0-9]*.RELEASE')]:
+            with self.subTest(tag=tag):
+                self.env.update(TAG_PREFIX=prefix, VERSION_COMPONENTS=components, VERSION_SUFFIX=suffix)
+                self.fixture['context']['payload']['release']['tag_name'] = tag
+                self.fixture['release']['tag_name'] = tag
+                self.fixture['context']['ref'] = 'refs/tags/' + tag
+                self.fixture['policies']['branch_policies'][0]['name'] = policy
+                self.run_policy()
+                self.fixture['policies']['branch_policies'][0]['name'] = '*'
+                self.run_policy(False)
+
+    def test_invalid_legacy_conventions_rejected(self):
+        for variable, value in [('TAG_PREFIX', '$(id)'), ('TAG_PREFIX', '../'),
+                                ('VERSION_COMPONENTS', '1'), ('VERSION_COMPONENTS', '4'),
+                                ('VERSION_SUFFIX', '.SNAPSHOT'), ('VERSION_SUFFIX', '-SNAPSHOT'),
+                                ('VERSION_SUFFIX', '.RELEASE\n')]:
+            with self.subTest(variable=variable, value=value), patch.dict(self.env, {variable: value}):
+                self.run_policy(False)
 
     def test_dispatch_draft_prerelease_and_fork_rejected(self):
         original = copy.deepcopy(self.fixture)
@@ -230,6 +267,9 @@ class WorkflowBoundaryTests(unittest.TestCase):
         checkout = step('build', 'Checkout validated commit')['with']
         self.assertEqual(checkout['ref'], '${{ needs.validate.outputs.sha }}')
         self.assertIs(checkout['persist-credentials'], False)
+        build = step('build', 'Build unsigned artifacts into a local repository')['run']
+        self.assertIn('-Dgpg.skip=true', build)
+        self.assertIn('-DnewVersion="$RELEASE_VERSION"', build)
 
     def test_official_jreleaser_action_runs_after_verification(self):
         steps = WORKFLOW['jobs']['publish']['steps']
@@ -254,6 +294,7 @@ class BundleTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / 'unsigned').mkdir()
         self.env = {'RUNNER_TEMP': str(self.root), 'RELEASE_TAG': TAG,
+                    'RELEASE_VERSION': TAG,
                     'GROUP_ID': 'com.playtika.reactivefeign', 'GITHUB_REPOSITORY': 'PlaytikaOSS/feign-reactive'}
         self.script = python_script('Prepare verified artifacts and fixed JReleaser configuration')
 
